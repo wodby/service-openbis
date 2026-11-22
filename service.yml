@@ -14,7 +14,8 @@ labels:
 
 options:
 - version: '7.0'
-  tag: '7.0'
+  tag: 7.0-r0
+  digest: sha256:6ecd4b7dc19db1626b5fb009edd71eadb18b0e9a7c64428f0ed888e040cb7cc1
   default: true
 
 deployment:
