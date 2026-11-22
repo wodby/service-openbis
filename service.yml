@@ -1,0 +1,222 @@
+name: openbis
+icon: openbis
+type: service
+title: openBIS
+guidance: GUIDANCE.md
+# The application, data store and file servers share one ReadWriteOnce volume
+# and coordinate through it, so openBIS runs as a single replica.
+scalable: false
+
+labels:
+- openbis
+- eln
+- lims
+
+options:
+- version: '7.0'
+  tag: '7.0'
+  default: true
+
+deployment:
+  shutdownGracePeriod: 120s
+
+# The three servers are reached through the openBIS Nginx service, which
+# routes /openbis, /datastore_server and /afs-server to them.
+endpoints:
+- name: openbis
+  ports:
+  - name: http
+    number: 8080
+    protocol: http
+    main: true
+    private: true
+  - name: dss
+    number: 8081
+    protocol: http
+    private: true
+  - name: afs
+    number: 8085
+    protocol: http
+    private: true
+
+settings:
+- name: admin-password
+  title: Admin password
+  description: Password of the openBIS user admin. openBIS sets it on every start, so changing the setting and redeploying changes the password.
+  required: true
+  secret: true
+  var: OPENBIS_ADMIN_PASSWORD
+  validation:
+    minLength: 12
+
+links:
+# openBIS keeps its data in three PostgreSQL databases: the main one and the
+# extra databases messages and pathinfo, which Wodby creates next to it for the
+# same user. Its two-phase commits need prepared transactions on the server.
+- name: postgres
+  title: PostgreSQL
+  required: true
+  database:
+    dbs:
+    - name: messages
+    - name: pathinfo
+  selectors:
+  - type: db
+    option: '18'
+    labels:
+    - postgres
+  env:
+  - name: OPENBIS_DB_HOST
+    value: '{{link.database.host}}'
+  - name: OPENBIS_DB_PORT
+    value: '{{link.database.port}}'
+  - name: OPENBIS_DB_NAME
+    value: '{{link.database.db.name}}'
+  - name: OPENBIS_DB_MESSAGES_NAME
+    value: '{{link.database.dbs.messages.name}}'
+  - name: OPENBIS_DB_PATHINFO_NAME
+    value: '{{link.database.dbs.pathinfo.name}}'
+  - name: OPENBIS_DB_USER
+    value: '{{link.database.user.name}}'
+    secret: true
+  - name: OPENBIS_DB_PASSWORD
+    value: '{{link.database.user.password}}'
+    secret: true
+- name: sendmail
+  title: SMTP server
+  selectors:
+  - type: service
+    labels:
+    - smtpd
+  env:
+  - name: SMTP_HOST
+    value: '{{link.host}}'
+  - name: SMTP_PORT
+    value: '{{link.port}}'
+
+env:
+# Shares of the container's memory limit for the Java heaps of the
+# application, data store and file servers.
+- name: OPENBIS_AS_MAX_RAM_PERCENTAGE
+  value: '45'
+- name: OPENBIS_DSS_MAX_RAM_PERCENTAGE
+  value: '12'
+- name: OPENBIS_AFS_MAX_RAM_PERCENTAGE
+  value: '12'
+
+volumes:
+- name: data
+  title: openBIS data and configuration
+  size: 20
+  helm:
+    labels: persistence.labels
+    values:
+    - name: persistence.enabled
+      value: true
+    - name: persistence.size
+      value: '{{volumes.data.size}}Gi'
+    - name: persistence.storageClass
+      value: '{{volumes.data.storageClassName}}'
+
+helm:
+  name: wodby
+  source: oci://registry-1.docker.io/wodby/stateful
+  chart: oci://registry-1.docker.io/wodby/stateful
+  version: 0.4.0
+  valueMappings:
+    replicas: replicaCount
+    serviceAccountName: serviceAccount.name
+    serviceAccountCreate: serviceAccount.create
+  values:
+  - name: containerName
+    value: openbis
+  - name: containerPorts
+    value:
+    - name: http
+      containerPort: 8080
+      protocol: TCP
+    - name: dss
+      containerPort: 8081
+      protocol: TCP
+    - name: afs
+      containerPort: 8085
+      protocol: TCP
+  - name: serviceAccount.automount
+    value: false
+  - name: podSecurityContext
+    value:
+      fsGroup: 1001
+      fsGroupChangePolicy: OnRootMismatch
+  - name: securityContext
+    value:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+        - ALL
+      runAsGroup: 1001
+      runAsNonRoot: true
+      runAsUser: 1001
+  - name: persistence.mountPath
+    value: /data
+  - name: terminationGracePeriodSeconds
+    value: 120
+  # The first start creates the database schemas and the lab notebook's
+  # master data, which takes several minutes on a small node.
+  - name: startupProbe
+    value:
+      httpGet:
+        path: /openbis/webapp/eln-lims/version.txt
+        port: http
+      failureThreshold: 180
+      periodSeconds: 10
+      timeoutSeconds: 5
+  - name: readinessProbe
+    value:
+      httpGet:
+        path: /openbis/webapp/eln-lims/version.txt
+        port: http
+      failureThreshold: 3
+      periodSeconds: 10
+      timeoutSeconds: 5
+  # The start script stops the container when one of the servers dies; the
+  # probe covers a hung application server.
+  - name: livenessProbe
+    value:
+      httpGet:
+        path: /openbis/webapp/eln-lims/version.txt
+        port: http
+      failureThreshold: 6
+      periodSeconds: 20
+      timeoutSeconds: 10
+
+workloads:
+- name: main
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: '{{helm.release}}'
+  kind: statefulset
+  primary: true
+  helm:
+    labels: commonLabels
+    annotations: commonAnnotations
+    volumes: extraVolumes
+  containers:
+  - name: openbis
+    image: wodby/openbis
+    # The image builds openBIS's public URLs from WODBY_PRIMARY_HOST.
+    routeMetadata: true
+    resources:
+      request:
+        cpu: 500
+        memory: 3072
+      limit:
+        memory: 7168
+    helm:
+      resources: resources
+      env: envVars
+      mounts: extraVolumeMounts
+      image:
+        repository: image.repository
+        tag: image.tag
+        registry: image.registry
+        pullPolicy: image.pullPolicy
